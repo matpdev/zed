@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Build the personal Zed (branch `custom`) with the official release profile and install it.
+#
+#   script/install-custom            # build + install a new release
+#   script/install-custom --list     # list installed releases
+#   script/install-custom --use ID   # switch back to an installed release (rollback)
+#
+# Layout (same as the official Linux tarball, so the CLI finds the editor in ../libexec):
+#   ~/.local/share/zed-custom/releases/<version>-<commit>/{bin/zed, libexec/zed-editor, share/...}
+#   ~/.local/share/zed-custom/current -> releases/<the active one>
+#   ~/.local/bin/{zed,zeditor} -> current/bin/zed
+#   ~/.local/share/applications/dev.zed.Zed.desktop
+#
+# Settings, extensions and sessions are not touched: they stay in ~/.config/zed and ~/.local/share/zed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ROOT="${ZED_CUSTOM_ROOT:-$HOME/.local/share/zed-custom}"
+KEEP="${KEEP:-3}"
+APP_ID=dev.zed.Zed
+BIN_DIR="$HOME/.local/bin"
+DESKTOP_FILE="$HOME/.local/share/applications/$APP_ID.desktop"
+
+activate() {
+    local release=$1
+    ln -sfn "releases/$release" "$ROOT/current"
+    mkdir -p "$BIN_DIR" "$(dirname "$DESKTOP_FILE")"
+    ln -sf "$ROOT/current/bin/zed" "$BIN_DIR/zed"
+    ln -sf "$ROOT/current/bin/zed" "$BIN_DIR/zeditor"
+    cp "$ROOT/current/share/applications/$APP_ID.desktop" "$DESKTOP_FILE"
+    update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+    echo "Active release: $release"
+}
+
+case ${1:-} in
+    --list)
+        current=$(readlink "$ROOT/current" 2>/dev/null || true)
+        for dir in "$ROOT"/releases/*/; do
+            name=$(basename "$dir")
+            [[ "releases/$name" == "$current" ]] && marker='*' || marker=' '
+            echo "$marker $name"
+        done
+        exit 0
+        ;;
+    --use)
+        [[ -d "$ROOT/releases/${2:-}" ]] || { echo "unknown release: ${2:-}" >&2; exit 1; }
+        activate "$2"
+        exit 0
+        ;;
+    "") ;;
+    *) echo "usage: $0 [--list | --use RELEASE]" >&2; exit 2 ;;
+esac
+
+if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+    echo "warning: uncommitted changes will be included in this build" >&2
+fi
+
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n1)
+commit=$(git rev-parse --short=9 HEAD)
+release="$version-$commit"
+dest="$ROOT/releases/$release"
+
+# --- Build (mirrors Arch's PKGBUILD: release profile, thin LTO, system sqlite/zstd) ---
+export PROTOC=/usr/bin/protoc
+export PROTOC_INCLUDE=/usr/include
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
+export ZSTD_SYS_USE_PKG_CONFIG=1
+export RELEASE_VERSION="$version"
+export ZED_UPDATE_EXPLANATION="Custom build: update with git in $PWD and run script/install-custom"
+LINK=()
+command -v mold >/dev/null && LINK=(mold -run)
+
+start=$(date +%s)
+"${LINK[@]}" cargo build --release -j "${JOBS:-8}" --package zed --package cli
+echo "Build finished in $(( ($(date +%s) - start) / 60 )) min"
+
+# --- Assemble the release folder ---
+tmp="$dest.tmp"
+rm -rf "$tmp"
+mkdir -p "$tmp/bin" "$tmp/libexec" "$tmp/share/applications" "$tmp/share/icons/hicolor/512x512/apps" \
+    "$tmp/share/icons/hicolor/1024x1024/apps"
+install -m755 target/release/cli "$tmp/bin/zed"
+install -m755 target/release/zed "$tmp/libexec/zed-editor"
+# Keep function symbols for backtraces, drop the (large) DWARF debug info.
+strip --strip-debug "$tmp/libexec/zed-editor" "$tmp/bin/zed"
+install -m644 crates/zed/resources/app-icon.png "$tmp/share/icons/hicolor/512x512/apps/zed.png"
+install -m644 crates/zed/resources/app-icon@2x.png "$tmp/share/icons/hicolor/1024x1024/apps/zed.png"
+DO_STARTUP_NOTIFY=true \
+    APP_ICON="$ROOT/current/share/icons/hicolor/512x512/apps/zed.png" \
+    APP_NAME="Zed" \
+    APP_CLI="$ROOT/current/bin/zed" \
+    APP_ID="$APP_ID" \
+    APP_ARGS="%U" \
+    envsubst < crates/zed/resources/zed.desktop.in > "$tmp/share/applications/$APP_ID.desktop"
+git log -1 --format='%H %s' > "$tmp/COMMIT"
+rm -rf "$dest"
+mv "$tmp" "$dest"
+
+activate "$release"
+
+# --- Keep only the newest $KEEP releases (never the active one) ---
+active=$(basename "$(readlink "$ROOT/current")")
+ls -1t "$ROOT/releases" | tail -n +"$((KEEP + 1))" | while read -r old; do
+    [[ $old == "$active" ]] || { echo "Removing old release $old"; rm -rf "${ROOT:?}/releases/$old"; }
+done
+
+"$BIN_DIR/zed" --version

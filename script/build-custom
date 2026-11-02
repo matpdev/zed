@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Build the personal Zed (branch `custom`).
+#
+#   script/build-custom                # release-fast build for daily use
+#   script/build-custom --dev          # debug build: fast incremental rebuilds while iterating
+#   script/build-custom [--dev] --test # also run the hover popover unit tests
+#
+# Binaries:
+#   release-fast -> target/release-fast/zed
+#   dev          -> target/debug/zed  (unoptimized: noticeably slower at runtime)
+#
+# Speed-ups over a plain cargo build:
+#   - mold as the linker (via `mold -run`, so rustflags and the build cache stay untouched)
+#   - release-fast: limited debuginfo instead of full (smaller binary, faster codegen/linking)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+PROFILE=release-fast
+RUN_TESTS=false
+for arg in "$@"; do
+    case $arg in
+        --dev) PROFILE=dev ;;
+        --test) RUN_TESTS=true ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+
+export PROTOC=/usr/bin/protoc
+export PROTOC_INCLUDE=/usr/include
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
+export ZSTD_SYS_USE_PKG_CONFIG=1
+export RELEASE_VERSION="${RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n1)}"
+export ZED_UPDATE_EXPLANATION='Custom build (matpdev/zed, branch custom)'
+export CARGO_PROFILE_RELEASE_FAST_DEBUG=limited
+
+# 15 GB of RAM: keep parallelism below the core count to avoid swapping
+JOBS="${JOBS:-8}"
+
+if command -v mold >/dev/null; then
+    LINK=(mold -run)
+else
+    echo "warning: mold not found, using the default linker" >&2
+    LINK=()
+fi
+
+start=$(date +%s)
+"${LINK[@]}" cargo build --profile "$PROFILE" -j "$JOBS" --package zed --package cli
+
+if $RUN_TESTS; then
+    "${LINK[@]}" cargo test --profile "$PROFILE" -j "$JOBS" --package editor --lib -- hover_popover
+fi
+
+out_dir=$([[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")
+elapsed=$(( $(date +%s) - start ))
+printf 'Done in %dm%02ds -> %s\n' $((elapsed / 60)) $((elapsed % 60)) "$PWD/target/$out_dir/zed"

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Run the debug build with live hover style tuning.
+# Edit hover-style.json at the repo root, save, and hover a symbol again: no rebuild needed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export ZED_HOVER_STYLE_FILE="$PWD/hover-style.json"
+exec target/debug/zed "$@"
