@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Package an existing `cargo build --release --package zed --package cli` into a tarball
+# that `script/install-custom` can install.
+#
+#   script/package-custom OUT.tar.gz
+#
+# Layout (same as the official Linux tarball, so the CLI finds the editor in ../libexec):
+#   bin/zed, libexec/zed-editor, share/icons/..., share/zed.desktop.in, RELEASE, COMMIT
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+out=${1:?usage: $0 OUT.tar.gz}
+target_dir="${CARGO_TARGET_DIR:-target}"
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n1)
+commit=$(git rev-parse --short=9 HEAD)
+release="$version-$commit"
+
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+app="$staging/zed-custom"
+mkdir -p "$app/bin" "$app/libexec" "$app/share/icons/hicolor/512x512/apps" \
+    "$app/share/icons/hicolor/1024x1024/apps"
+
+install -m755 "$target_dir/release/cli" "$app/bin/zed"
+install -m755 "$target_dir/release/zed" "$app/libexec/zed-editor"
+# Keep function symbols for backtraces, drop the (large) DWARF debug info.
+strip --strip-debug "$app/bin/zed" "$app/libexec/zed-editor"
+install -m644 crates/zed/resources/app-icon.png "$app/share/icons/hicolor/512x512/apps/zed.png"
+install -m644 crates/zed/resources/app-icon@2x.png "$app/share/icons/hicolor/1024x1024/apps/zed.png"
+install -m644 crates/zed/resources/zed.desktop.in "$app/share/zed.desktop.in"
+echo "$release" > "$app/RELEASE"
+git log -1 --format='%H %s' > "$app/COMMIT"
+
+mkdir -p "$(dirname "$out")"
+tar -C "$staging" -czf "$out" zed-custom
+echo "Packaged $release -> $out ($(du -h "$out" | cut -f1))"

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Build the personal Zed (branch `custom`) with the official release profile and install it.
+# Install the personal Zed (branch `custom`).
 #
-#   script/install-custom            # build + install a new release
-#   script/install-custom --list     # list installed releases
-#   script/install-custom --use ID   # switch back to an installed release (rollback)
+#   script/install-custom              # download the latest GitHub release of the fork and install it
+#   script/install-custom --local      # build locally (official release profile) and install
+#   script/install-custom --file X     # install a tarball made by script/package-custom
+#   script/install-custom --list       # list installed releases (* = active)
+#   script/install-custom --use ID     # switch to another installed release (rollback)
 #
-# Layout (same as the official Linux tarball, so the CLI finds the editor in ../libexec):
+# Installed layout:
 #   ~/.local/share/zed-custom/releases/<version>-<commit>/{bin/zed, libexec/zed-editor, share/...}
 #   ~/.local/share/zed-custom/current -> releases/<the active one>
 #   ~/.local/bin/{zed,zeditor} -> current/bin/zed
@@ -15,6 +17,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+REPO="${ZED_CUSTOM_REPO:-matpdev/zed}"
+ASSET=zed-custom-linux-x86_64.tar.gz
 ROOT="${ZED_CUSTOM_ROOT:-$HOME/.local/share/zed-custom}"
 KEEP="${KEEP:-3}"
 APP_ID=dev.zed.Zed
@@ -27,9 +31,33 @@ activate() {
     mkdir -p "$BIN_DIR" "$(dirname "$DESKTOP_FILE")"
     ln -sf "$ROOT/current/bin/zed" "$BIN_DIR/zed"
     ln -sf "$ROOT/current/bin/zed" "$BIN_DIR/zeditor"
-    cp "$ROOT/current/share/applications/$APP_ID.desktop" "$DESKTOP_FILE"
+    DO_STARTUP_NOTIFY=true \
+        APP_ICON="$ROOT/current/share/icons/hicolor/512x512/apps/zed.png" \
+        APP_NAME="Zed" \
+        APP_CLI="$ROOT/current/bin/zed" \
+        APP_ID="$APP_ID" \
+        APP_ARGS="%U" \
+        envsubst < "$ROOT/current/share/zed.desktop.in" > "$DESKTOP_FILE"
     update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
     echo "Active release: $release"
+}
+
+install_tarball() {
+    local tarball=$1 staging release
+    staging=$(mktemp -d)
+    tar -C "$staging" -xzf "$tarball"
+    release=$(<"$staging/zed-custom/RELEASE")
+    mkdir -p "$ROOT/releases"
+    rm -rf "${ROOT:?}/releases/$release"
+    mv "$staging/zed-custom" "$ROOT/releases/$release"
+    rm -rf "$staging"
+    activate "$release"
+
+    # Keep only the newest $KEEP releases (never the active one).
+    ls -1t "$ROOT/releases" | tail -n +"$((KEEP + 1))" | while read -r old; do
+        [[ $old == "$release" ]] || { echo "Removing old release $old"; rm -rf "${ROOT:?}/releases/$old"; }
+    done
+    "$BIN_DIR/zed" --version
 }
 
 case ${1:-} in
@@ -38,70 +66,46 @@ case ${1:-} in
         for dir in "$ROOT"/releases/*/; do
             name=$(basename "$dir")
             [[ "releases/$name" == "$current" ]] && marker='*' || marker=' '
-            echo "$marker $name"
+            echo "$marker $name  $(cut -c1-60 "$dir/COMMIT" 2>/dev/null | cut -d' ' -f2-)"
         done
-        exit 0
         ;;
     --use)
         [[ -d "$ROOT/releases/${2:-}" ]] || { echo "unknown release: ${2:-}" >&2; exit 1; }
         activate "$2"
-        exit 0
         ;;
-    "") ;;
-    *) echo "usage: $0 [--list | --use RELEASE]" >&2; exit 2 ;;
+    --file)
+        install_tarball "${2:?usage: $0 --file TARBALL}"
+        ;;
+    --local)
+        if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+            echo "warning: uncommitted changes will be included in this build" >&2
+        fi
+        export PROTOC=/usr/bin/protoc PROTOC_INCLUDE=/usr/include
+        export LIBSQLITE3_SYS_USE_PKG_CONFIG=1 ZSTD_SYS_USE_PKG_CONFIG=1
+        export RELEASE_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n1)
+        export ZED_UPDATE_EXPLANATION="Custom build: update with git in $PWD and run script/install-custom"
+        LINK=()
+        command -v mold >/dev/null && LINK=(mold -run)
+        "${LINK[@]}" cargo build --release -j "${JOBS:-8}" --package zed --package cli
+        tarball=$(mktemp --suffix=.tar.gz)
+        script/package-custom "$tarball"
+        install_tarball "$tarball"
+        rm -f "$tarball"
+        ;;
+    "")
+        echo "Fetching the latest release of $REPO..."
+        url=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
+            python3 -I -c 'import json, sys
+release = json.load(sys.stdin)
+print(next(a["browser_download_url"] for a in release["assets"] if a["name"] == sys.argv[1]))' "$ASSET")
+        tarball=$(mktemp --suffix=.tar.gz)
+        trap 'rm -f "$tarball"' EXIT
+        echo "Downloading $url"
+        curl -fL --retry 3 -o "$tarball" "$url"
+        install_tarball "$tarball"
+        ;;
+    *)
+        echo "usage: $0 [--local | --file TARBALL | --list | --use RELEASE]" >&2
+        exit 2
+        ;;
 esac
-
-if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
-    echo "warning: uncommitted changes will be included in this build" >&2
-fi
-
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n1)
-commit=$(git rev-parse --short=9 HEAD)
-release="$version-$commit"
-dest="$ROOT/releases/$release"
-
-# --- Build (mirrors Arch's PKGBUILD: release profile, thin LTO, system sqlite/zstd) ---
-export PROTOC=/usr/bin/protoc
-export PROTOC_INCLUDE=/usr/include
-export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
-export ZSTD_SYS_USE_PKG_CONFIG=1
-export RELEASE_VERSION="$version"
-export ZED_UPDATE_EXPLANATION="Custom build: update with git in $PWD and run script/install-custom"
-LINK=()
-command -v mold >/dev/null && LINK=(mold -run)
-
-start=$(date +%s)
-"${LINK[@]}" cargo build --release -j "${JOBS:-8}" --package zed --package cli
-echo "Build finished in $(( ($(date +%s) - start) / 60 )) min"
-
-# --- Assemble the release folder ---
-tmp="$dest.tmp"
-rm -rf "$tmp"
-mkdir -p "$tmp/bin" "$tmp/libexec" "$tmp/share/applications" "$tmp/share/icons/hicolor/512x512/apps" \
-    "$tmp/share/icons/hicolor/1024x1024/apps"
-install -m755 target/release/cli "$tmp/bin/zed"
-install -m755 target/release/zed "$tmp/libexec/zed-editor"
-# Keep function symbols for backtraces, drop the (large) DWARF debug info.
-strip --strip-debug "$tmp/libexec/zed-editor" "$tmp/bin/zed"
-install -m644 crates/zed/resources/app-icon.png "$tmp/share/icons/hicolor/512x512/apps/zed.png"
-install -m644 crates/zed/resources/app-icon@2x.png "$tmp/share/icons/hicolor/1024x1024/apps/zed.png"
-DO_STARTUP_NOTIFY=true \
-    APP_ICON="$ROOT/current/share/icons/hicolor/512x512/apps/zed.png" \
-    APP_NAME="Zed" \
-    APP_CLI="$ROOT/current/bin/zed" \
-    APP_ID="$APP_ID" \
-    APP_ARGS="%U" \
-    envsubst < crates/zed/resources/zed.desktop.in > "$tmp/share/applications/$APP_ID.desktop"
-git log -1 --format='%H %s' > "$tmp/COMMIT"
-rm -rf "$dest"
-mv "$tmp" "$dest"
-
-activate "$release"
-
-# --- Keep only the newest $KEEP releases (never the active one) ---
-active=$(basename "$(readlink "$ROOT/current")")
-ls -1t "$ROOT/releases" | tail -n +"$((KEEP + 1))" | while read -r old; do
-    [[ $old == "$active" ]] || { echo "Removing old release $old"; rm -rf "${ROOT:?}/releases/$old"; }
-done
-
-"$BIN_DIR/zed" --version
