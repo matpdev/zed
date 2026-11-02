@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{
-    DelayMs, DiagnosticSeverityContent, ShowScrollbar, serialize_f32_with_two_decimal_places,
+    DelayMs, DiagnosticSeverityContent, FontSize, ShowScrollbar,
+    serialize_f32_with_two_decimal_places,
 };
 
 #[with_fallible_options]
@@ -66,6 +67,18 @@ pub struct EditorSettingsContent {
     ///
     /// Default: 300
     pub hover_popover_hiding_delay: Option<DelayMs>,
+    /// Font size (in pixels) of the text in the informational hover box.
+    /// When unset, the hover box uses the buffer font size.
+    ///
+    /// Default: null
+    pub hover_popover_font_size: Option<FontSize>,
+    /// Maximum width of the informational hover box, in characters.
+    /// The hover box never grows past half of the editor width.
+    ///
+    /// Default: 120
+    pub hover_popover_max_width: Option<u32>,
+    /// Action buttons shown at the bottom of the informational hover box.
+    pub hover_popover_actions: Option<HoverPopoverActionsContent>,
     /// Toolbar related settings
     pub toolbar: Option<ToolbarContent>,
     /// Scrollbar related settings
@@ -373,6 +386,48 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: false
     pub enabled: Option<bool>,
+}
+
+/// Action buttons shown at the bottom of the informational hover box.
+#[with_fallible_options]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+pub struct HoverPopoverActionsContent {
+    /// Whether to show an "Ask AI" button that opens a new agent thread
+    /// asking about the hovered symbol. Hidden when AI is disabled.
+    ///
+    /// Default: true
+    pub ask_ai: Option<bool>,
+    /// Documentation sources offered for the hovered symbol, in order.
+    /// A button is shown for every source whose filters all match.
+    ///
+    /// Default: []
+    pub doc_sources: Option<Vec<HoverDocSourceContent>>,
+}
+
+/// A documentation source for symbols in the informational hover box.
+///
+/// `url` and `command` may use the `{symbol}` and `{language}` placeholders;
+/// exactly one of them must be set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HoverDocSourceContent {
+    /// Text of the button.
+    pub label: String,
+    /// Regex the hovered symbol must match.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Languages (e.g. "C++", "Rust") the source applies to. Applies to all when unset.
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+    /// Regex the hover documentation text must match.
+    #[serde(default)]
+    pub hover_pattern: Option<String>,
+    /// URL to open. Placeholders are URL-encoded.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Program and arguments to run.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 // Toolbar related settings

@@ -2,22 +2,22 @@ use crate::{
     Anchor, AnchorRangeExt, DisplayPoint, DisplayRow, Editor, EditorSettings, EditorSnapshot,
     GlobalDiagnosticRenderer, HighlightKey, Hover,
     display_map::{ToDisplayPoint, is_invisible},
-    editor_settings::EditorSettingsScrollbarProxy,
+    editor_settings::{EditorSettingsScrollbarProxy, HoverDocTarget},
     hover_links::{InlayHighlight, RangeInEditor},
     movement::TextLayoutDetails,
     scroll::ScrollAmount,
 };
 use anyhow::Context as _;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
-    TextStyleRefinement, Window, canvas, div, px,
+    Action as _, AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    ScrollHandle, Size, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
+    TaskExt, TextStyleRefinement, Window, canvas, div, px,
 };
 use language::{CharKind, DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
-use multi_buffer::{MultiBufferOffset, MultiBufferSnapshot, ToOffset, ToPoint};
+use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset, ToPoint};
 use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
 use settings::Settings;
 use std::{
@@ -793,7 +793,13 @@ fn parse_blocks(
     language: Option<Arc<Language>>,
     cx: &mut AsyncWindowContext,
 ) -> Option<Entity<Markdown>> {
-    let combined_text = combine_hover_blocks(blocks);
+    let mut combined_text = remove_rules_before_headings(&combine_hover_blocks(blocks));
+    if language
+        .as_ref()
+        .is_some_and(|language| is_c_family_language(language.name().as_ref()))
+    {
+        combined_text = clean_doxygen_markdown(&combined_text);
+    }
 
     if combined_text.trim().is_empty() {
         return None;
@@ -808,6 +814,296 @@ fn parse_blocks(
         )
     })
     .ok()
+}
+
+/// Height reserved for the hover actions footer when limiting the popover content height.
+const HOVER_ACTIONS_FOOTER_HEIGHT: Pixels = px(30.);
+
+/// Maximum number of bytes of hover documentation included in an "Ask AI" prompt.
+const ASK_AI_MAX_HOVER_BYTES: usize = 4000;
+
+/// Replaces `{symbol}` and `{language}` in a doc source template, URL-encoding them for URLs.
+fn expand_hover_template(template: &str, symbol: &str, language: &str, url_encode: bool) -> String {
+    let encode = |value: &str| {
+        if url_encode {
+            urlencoding::encode(value).into_owned()
+        } else {
+            value.to_string()
+        }
+    };
+    template
+        .replace("{symbol}", &encode(symbol))
+        .replace("{language}", &encode(language))
+}
+
+fn open_hover_doc_target(target: &HoverDocTarget, symbol: &str, language: &str, cx: &mut App) {
+    match target {
+        HoverDocTarget::Url(template) => {
+            cx.open_url(&expand_hover_template(template, symbol, language, true));
+        }
+        HoverDocTarget::Command(templates) => {
+            let parts = templates
+                .iter()
+                .map(|template| expand_hover_template(template, symbol, language, false))
+                .collect::<Vec<_>>();
+            let Some((program, args)) = parts.split_first() else {
+                return;
+            };
+            let mut command = util::command::new_command(program);
+            command.args(args);
+            let program = program.clone();
+            cx.background_spawn(async move {
+                match command.status().await {
+                    Ok(status) if !status.success() => {
+                        log::warn!("hover doc source command {program:?} exited with {status}")
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::error!("failed to run hover doc source {program:?}: {error}")
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+}
+
+/// Builds the question sent to the agent by the hover popover's "Ask AI" button.
+fn ask_about_symbol_prompt(
+    symbol: &str,
+    language: Option<&str>,
+    line: &str,
+    hover_text: &str,
+) -> String {
+    let language = language.unwrap_or("código");
+    let mut prompt = format!(
+        "Explique o símbolo `{symbol}` ({language}): o que ele é, para que serve e como é usado \
+         normalmente, com um exemplo curto de uso. Seja objetivo.\n\n\
+         Linha de código onde ele aparece:\n```\n{}\n```\n",
+        line.trim()
+    );
+    let hover_text = hover_text.trim();
+    if !hover_text.is_empty() {
+        let mut end = hover_text.len().min(ASK_AI_MAX_HOVER_BYTES);
+        while !hover_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let ellipsis = if end < hover_text.len() { "\n…" } else { "" };
+        prompt.push_str(&format!(
+            "\nDocumentação do language server:\n\n{}{ellipsis}\n",
+            &hover_text[..end]
+        ));
+    }
+    prompt
+}
+
+fn is_c_family_language(name: &str) -> bool {
+    matches!(name, "C" | "C++" | "Objective-C" | "Objective-C++" | "CUDA")
+}
+
+/// Turns the Doxygen leftovers that clangd passes through verbatim into readable Markdown.
+///
+/// clangd interprets `@brief`, `@param` and `@return`, but emits every other command as
+/// `**@command**` (including library-specific aliases such as GLFW's `@thread_safety`),
+/// keeps `%word` autolink escapes and raw HTML from comments, and produces broken links
+/// for `[text](@ref target)`. Code fences are left untouched.
+fn clean_doxygen_markdown(markdown: &str) -> String {
+    use std::sync::LazyLock;
+
+    /// `[text](**@ref** `target)`` and `[text](@ref target)` -> `text`
+    static REF_LINK: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\[([^\]]+)\]\((?:\*\*[@\\]ref\*\*\s*`[^`]*`\)?|[@\\]ref\s+[^)]*\))")
+            .unwrap()
+    });
+    /// `**@ref** `target.`` -> `` `target`. ``
+    static REF: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\*\*[@\\]ref\*\*\s*`([^`]*?)([.,;:]?)`").unwrap());
+    /// `%word` (Doxygen's "don't autolink" escape) -> `word`; short words are kept so
+    /// printf-style specifiers like `%d` or `%lu` survive.
+    static PERCENT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(^|[\s(\["'])%([A-Za-z_]\w{2,})"#).unwrap());
+    /// `<a href="...">text</a>` -> `text`
+    static HTML_LINK: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?s)<a\s[^>]*>(.*?)</a>").unwrap());
+    /// `<code>`/`<tt>` -> backticks
+    static HTML_CODE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"</?(?:code|tt)>").unwrap());
+    /// Other simple formatting tags are dropped.
+    static HTML_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"</?(?:b|i|em|strong|p|br|span|div|sup|sub)(?:\s[^>]*)?\s*/?>").unwrap()
+    });
+    /// A paragraph starting with an unhandled command: `**@thread_safety** text`.
+    static COMMAND: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^\*\*[@\\]([A-Za-z_]+)\*\*\s*(.*)$").unwrap());
+
+    fn command_label(command: &str) -> String {
+        let words = command.replace('_', " ");
+        let mut chars = words.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect(),
+            None => String::new(),
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    // Lines inside code fences, which must be kept verbatim.
+    let mut verbatim: Vec<bool> = Vec::new();
+    let mut see_also: Vec<String> = Vec::new();
+    let mut see_also_line: Option<usize> = None;
+    let mut open_fence: Option<&str> = None;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if let Some(fence) = open_fence {
+            if trimmed.starts_with(fence) {
+                open_fence = None;
+            }
+            lines.push(line.to_string());
+            verbatim.push(true);
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            open_fence = Some(if trimmed.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            });
+            lines.push(line.to_string());
+            verbatim.push(true);
+            continue;
+        }
+
+        let line = REF_LINK.replace_all(line, "$1");
+        let line = REF.replace_all(&line, "`$1`$2");
+        let line = PERCENT.replace_all(&line, "$1$2");
+        let line = HTML_LINK.replace_all(&line, "$1");
+        let line = HTML_CODE.replace_all(&line, "`");
+        let line = HTML_TAG.replace_all(&line, "");
+
+        let Some(captures) = COMMAND.captures(line.trim()) else {
+            lines.push(line.into_owned());
+            verbatim.push(false);
+            continue;
+        };
+        let command = captures[1].to_ascii_lowercase();
+        let rest = captures[2].trim().to_string();
+        match command.as_str() {
+            // Only meaningful for the generated Doxygen site.
+            "ingroup" | "headerfile" | "addtogroup" | "defgroup" | "internal" | "file" => {}
+            "sa" | "see" => {
+                if !rest.is_empty() {
+                    see_also.push(rest);
+                }
+                if see_also_line.is_none() {
+                    see_also_line = Some(lines.len());
+                    lines.push(String::new());
+                    verbatim.push(false);
+                }
+            }
+            _ => {
+                let label = command_label(&captures[1]);
+                lines.push(if rest.is_empty() {
+                    format!("**{label}:**")
+                } else {
+                    format!("**{label}:** {rest}")
+                });
+                verbatim.push(false);
+            }
+        }
+    }
+
+    if let Some(index) = see_also_line {
+        lines[index] = if see_also.is_empty() {
+            String::new()
+        } else {
+            format!("**See also:** {}", see_also.join(", "))
+        };
+    }
+
+    // Removed paragraphs leave runs of blank lines behind; collapse them.
+    let mut result = String::with_capacity(markdown.len());
+    let mut previous_blank = false;
+    for (line, verbatim) in lines.iter().zip(&verbatim) {
+        let blank = line.trim().is_empty();
+        if blank && previous_blank && !verbatim {
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+        previous_blank = blank;
+    }
+    let result = result.trim_end().to_string();
+    if markdown.ends_with('\n') {
+        result + "\n"
+    } else {
+        result
+    }
+}
+
+/// Drops thematic breaks (`---`, `***`, `___`) that sit directly before a heading.
+///
+/// Language servers such as clangd separate every section with a rule *and* give it a
+/// heading; in a small popover the heading alone already separates the sections, and the
+/// extra rule only adds noise. Rules inside code fences and setext underlines (a `---` right
+/// after a paragraph line) are left untouched.
+fn remove_rules_before_headings(markdown: &str) -> String {
+    fn is_rule(line: &str) -> bool {
+        let line = line.trim();
+        let Some(first) = line.chars().next() else {
+            return false;
+        };
+        matches!(first, '-' | '*' | '_')
+            && line.chars().filter(|c| !c.is_whitespace()).count() >= 3
+            && line.chars().all(|c| c == first || c == ' ' || c == '\t')
+    }
+    fn fence_marker(line: &str) -> Option<&'static str> {
+        let line = line.trim_start();
+        if line.starts_with("```") {
+            Some("```")
+        } else if line.starts_with("~~~") {
+            Some("~~~")
+        } else {
+            None
+        }
+    }
+
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut result = String::with_capacity(markdown.len());
+    let mut open_fence: Option<&str> = None;
+    let mut previous_line_blank = true;
+    let mut skipped_rule = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(fence) = open_fence {
+            if line.trim_start().starts_with(fence) {
+                open_fence = None;
+            }
+        } else if let Some(fence) = fence_marker(line) {
+            open_fence = Some(fence);
+        } else if previous_line_blank && is_rule(line) {
+            let next_content = lines[index + 1..].iter().find(|l| !l.trim().is_empty());
+            if next_content.is_some_and(|l| l.trim_start().starts_with('#')) {
+                skipped_rule = true;
+                continue;
+            }
+        }
+
+        // Avoid leaving two blank lines where a rule was removed.
+        let is_blank = line.trim().is_empty();
+        if !(skipped_rule && is_blank && previous_line_blank) {
+            result.push_str(line);
+            result.push('\n');
+        }
+        if !is_blank {
+            skipped_rule = false;
+        }
+        previous_line_blank = is_blank;
+    }
+
+    if !markdown.ends_with('\n') {
+        result.pop();
+    }
+    result
 }
 
 fn combine_hover_blocks(blocks: &[HoverBlock]) -> String {
@@ -1025,7 +1321,89 @@ fn unclosed_code_fence(markdown: &str) -> Option<String> {
     open_fence.map(|fence| fence.fence_char.to_string().repeat(fence.len))
 }
 
+/// Spacing and sizing knobs of the documentation hover popover.
+///
+/// In debug builds these can be tuned live, without rebuilding: point the
+/// `ZED_HOVER_STYLE_FILE` environment variable at a JSON file containing any subset of
+/// these fields (snake_case). The file is re-read whenever it changes; hover a symbol
+/// again to see the result. Release builds always use the defaults.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HoverStyleTuning {
+    /// Horizontal padding of the popover content, in pixels.
+    padding_x: f32,
+    /// Vertical padding of the popover content, in pixels.
+    padding_y: f32,
+    /// Gap between the popover's top-level blocks, in pixels.
+    gap: f32,
+    /// Font size of section headings, in rems.
+    heading_size: f32,
+    /// Space above section headings, in rems.
+    heading_margin_top: f32,
+    /// Space below section headings, in rems.
+    heading_margin_bottom: f32,
+    /// Line height of prose, in rems.
+    line_height: f32,
+    /// Space after each paragraph (and around rules), in pixels.
+    paragraph_spacing: f32,
+    /// Vertical margin around code blocks, in rems.
+    code_block_margin: f32,
+}
+
+impl Default for HoverStyleTuning {
+    fn default() -> Self {
+        Self {
+            padding_x: 12.,
+            padding_y: 8.,
+            gap: 8.,
+            heading_size: 0.875,
+            heading_margin_top: 0.75,
+            heading_margin_bottom: 0.25,
+            line_height: 1.4,
+            paragraph_spacing: 8.,
+            code_block_margin: 0.5,
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn hover_style_tuning() -> HoverStyleTuning {
+    HoverStyleTuning::default()
+}
+
+#[cfg(debug_assertions)]
+fn hover_style_tuning() -> HoverStyleTuning {
+    use std::{sync::LazyLock, time::SystemTime};
+
+    static PATH: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| std::env::var_os("ZED_HOVER_STYLE_FILE").map(PathBuf::from));
+    static CACHE: parking_lot::Mutex<Option<(SystemTime, HoverStyleTuning)>> =
+        parking_lot::Mutex::new(None);
+
+    let Some(path) = PATH.as_ref() else {
+        return HoverStyleTuning::default();
+    };
+    let Ok(modified) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return HoverStyleTuning::default();
+    };
+    let mut cache = CACHE.lock();
+    if let Some((cached_at, tuning)) = *cache
+        && cached_at == modified
+    {
+        return tuning;
+    }
+    let tuning = std::fs::read_to_string(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| Ok(serde_json::from_str::<HoverStyleTuning>(&text)?))
+        .inspect_err(|error| log::error!("invalid ZED_HOVER_STYLE_FILE {path:?}: {error}"))
+        .unwrap_or_default();
+    log::info!("hover style tuning loaded: {tuning:?}");
+    *cache = Some((modified, tuning));
+    tuning
+}
+
 pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let tuning = hover_style_tuning();
     let settings = ThemeSettings::get_global(cx);
     let ui_font_family = settings.ui_font.family.clone();
     let ui_font_features = settings.ui_font.features.clone();
@@ -1035,18 +1413,21 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let buffer_font_fallbacks = settings.buffer_font.fallbacks.clone();
     let buffer_font_weight = settings.buffer_font.weight;
 
+    let hover_font_size = EditorSettings::get_global(cx).hover_popover_font_size;
+
     let mut base_text_style = window.text_style();
     base_text_style.refine(&TextStyleRefinement {
         font_family: Some(ui_font_family),
         font_features: Some(ui_font_features),
         font_fallbacks: ui_font_fallbacks,
+        font_size: hover_font_size.map(Into::into),
         color: Some(cx.theme().colors().editor_foreground),
         ..Default::default()
     });
     MarkdownStyle {
         base_text_style,
         code_block: StyleRefinement::default()
-            .my(rems(1.))
+            .my(rems(tuning.code_block_margin))
             .font_buffer(cx)
             .font_features(buffer_font_features.clone())
             .font_weight(buffer_font_weight),
@@ -1075,11 +1456,16 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
         },
         syntax: cx.theme().syntax().clone(),
         selection_background_color: cx.theme().colors().element_selection_background,
+        // Section headings in hover docs (e.g. clangd's "Brief", "Parameters") are labels,
+        // not titles: keep them small and muted so the documentation itself stands out.
         heading: StyleRefinement::default()
-            .font_weight(FontWeight::BOLD)
-            .text_base()
-            .mt(rems(1.))
-            .mb_0(),
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_size(rems(tuning.heading_size))
+            .text_color(Color::Muted.color(cx))
+            .mt(rems(tuning.heading_margin_top))
+            .mb(rems(tuning.heading_margin_bottom)),
+        paragraph_line_height: rems(tuning.line_height).into(),
+        paragraph_spacing: px(tuning.paragraph_spacing),
         table_columns_min_size: true,
         ..Default::default()
     }
@@ -1391,7 +1777,7 @@ impl HoverState {
             elements.push(diagnostic_popover.render(max_size, window, cx));
         }
         for info_popover in &mut self.info_popovers {
-            elements.push(info_popover.render(max_size, window, cx));
+            elements.push(info_popover.render(snapshot, max_size, window, cx));
         }
 
         Some((point, elements))
@@ -1547,6 +1933,7 @@ impl FallbackHoverState {
 impl InfoPopover {
     pub(crate) fn render(
         &mut self,
+        snapshot: &EditorSnapshot,
         max_size: Size<Pixels>,
         window: &mut Window,
         cx: &mut Context<Editor>,
@@ -1558,6 +1945,16 @@ impl InfoPopover {
         let parsed_content = self.parsed_content.clone();
         let debugger_hover = self.debugger_hover.clone();
         let debugger_hover_only = debugger_hover.is_some();
+        let actions_footer = if debugger_hover_only {
+            None
+        } else {
+            self.render_actions_footer(snapshot, parsed_content.as_ref(), cx)
+        };
+        let footer_height = if actions_footer.is_some() {
+            HOVER_ACTIONS_FOOTER_HEIGHT
+        } else {
+            Pixels::ZERO
+        };
         let debugger_content_width = debugger_hover
             .as_ref()
             .and_then(|view| view.read(cx).content_width(window, cx));
@@ -1623,7 +2020,7 @@ impl InfoPopover {
                             .max_h(if debugger_hover_only {
                                 (max_size.height - DEBUGGER_HOVER_HEADER_HEIGHT).max(Pixels::ZERO)
                             } else {
-                                max_size.height
+                                (max_size.height - footer_height).max(Pixels::ZERO)
                             })
                             .when(debugger_hover_only, |this| {
                                 this.min_w(DEBUGGER_HOVER_MIN_WIDTH.min(max_size.width))
@@ -1635,7 +2032,12 @@ impl InfoPopover {
                                     .when_some(debugger_content_width, |this, width| this.w(width))
                                     .flex_none()
                                     .when(debugger_hover_only, |this| this.gap_0().p_1())
-                                    .when(!debugger_hover_only, |this| this.gap_2().p_2())
+                                    .when(!debugger_hover_only, |this| {
+                                        let tuning = hover_style_tuning();
+                                        this.gap(px(tuning.gap))
+                                            .px(px(tuning.padding_x))
+                                            .py(px(tuning.padding_y))
+                                    })
                                     .when_some(debugger_hover, |this, debugger_hover| {
                                         this.child(debugger_hover)
                                     })
@@ -1682,7 +2084,116 @@ impl InfoPopover {
                     )
                 },
             )
+            .children(actions_footer)
             .into_any_element()
+    }
+
+    /// Footer with documentation, web search and "Ask AI" buttons for the hovered symbol,
+    /// as configured in `hover_popover_actions`.
+    fn render_actions_footer(
+        &self,
+        snapshot: &EditorSnapshot,
+        parsed_content: Option<&Entity<Markdown>>,
+        cx: &mut Context<Editor>,
+    ) -> Option<AnyElement> {
+        let RangeInEditor::Text(range) = &self.symbol_range else {
+            return None;
+        };
+        let actions = EditorSettings::get_global(cx).hover_popover_actions.clone();
+        let ask_ai = actions.ask_ai && !project::DisableAiSettings::get_global(cx).disable_ai;
+        if !ask_ai && actions.doc_sources.is_empty() {
+            return None;
+        }
+
+        let buffer = snapshot.buffer_snapshot();
+        let symbol = buffer
+            .text_for_range(range.clone())
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if symbol.is_empty() || symbol.contains('\n') {
+            return None;
+        }
+        let language = buffer
+            .language_at(range.start)
+            .map(|language| language.name().to_string());
+        let hover_text = parsed_content
+            .map(|markdown| markdown.read(cx).source().to_string())
+            .unwrap_or_default();
+
+        let sources = actions
+            .doc_sources
+            .iter()
+            .filter(|source| source.matches(&symbol, language.as_deref(), &hover_text))
+            .cloned()
+            .collect::<Vec<_>>();
+        if sources.is_empty() && !ask_ai {
+            return None;
+        }
+
+        let row = range.start.to_point(&buffer).row;
+        let line = buffer
+            .text_for_range(
+                text::Point::new(row, 0)
+                    ..text::Point::new(row, buffer.line_len(MultiBufferRow(row))),
+            )
+            .collect::<String>();
+
+        let language_label = language.clone().unwrap_or_default();
+        let editor = cx.entity().downgrade();
+        let tuning = hover_style_tuning();
+        let mut footer = h_flex()
+            .id("hover-actions-footer")
+            .w_full()
+            .flex_wrap()
+            .gap_1()
+            .px(px((tuning.padding_x - 6.).max(0.)))
+            .py_0p5()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant);
+
+        for (index, source) in sources.into_iter().enumerate() {
+            let icon = match source.target {
+                HoverDocTarget::Url(_) => IconName::ArrowUpRight,
+                HoverDocTarget::Command(_) => IconName::Book,
+            };
+            let symbol = symbol.clone();
+            let language = language_label.clone();
+            let editor = editor.clone();
+            footer = footer.child(
+                Button::new(("hover-doc-source", index), source.label.clone())
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                    .style(ButtonStyle::Subtle)
+                    .on_click(move |_, _, cx| {
+                        open_hover_doc_target(&source.target, &symbol, &language, cx);
+                        editor.update(cx, |editor, cx| hide_hover(editor, cx)).ok();
+                    }),
+            );
+        }
+
+        if ask_ai {
+            let action = zed_actions::agent::AskAboutSymbol {
+                symbol: symbol.clone().into(),
+                prompt: ask_about_symbol_prompt(&symbol, language.as_deref(), &line, &hover_text),
+            };
+            footer = footer.child(
+                Button::new("hover-ask-ai", "Perguntar à IA")
+                    .label_size(LabelSize::Small)
+                    .start_icon(
+                        Icon::new(IconName::ZedAssistant)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(action.boxed_clone(), cx);
+                        editor.update(cx, |editor, cx| hide_hover(editor, cx)).ok();
+                    }),
+            );
+        }
+
+        Some(footer.into_any_element())
     }
 
     pub fn scroll(&self, amount: ScrollAmount, window: &mut Window, cx: &mut Context<Editor>) {
@@ -2750,6 +3261,184 @@ mod tests {
                 "Oversized hover contents should be truncated before display"
             );
         });
+    }
+
+    fn doc_source(json: &str) -> crate::editor_settings::HoverDocSource {
+        crate::editor_settings::HoverDocSource::from_content(serde_json::from_str(json).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_hover_doc_source_matching() {
+        let vulkan = doc_source(
+            r#"{ "label": "Vulkan", "pattern": "^(vk|Vk|VK_)\\w+$", "command": ["vkdoc", "{symbol}"] }"#,
+        );
+        assert!(vulkan.matches("vkCreateSemaphore", Some("C++"), ""));
+        assert!(vulkan.matches("VK_SUCCESS", None, ""));
+        assert!(!vulkan.matches("memset", Some("C++"), ""));
+
+        let cppreference = doc_source(
+            r#"{ "label": "cppreference", "languages": ["C++", "C"],
+                 "hover_pattern": "In namespace std|provided by `<\\w+(\\.h)?>`",
+                 "url": "https://en.cppreference.com/mwiki/index.php?search={symbol}" }"#,
+        );
+        assert!(cppreference.matches("vector", Some("C++"), "// In namespace std\ntemplate <>"));
+        assert!(cppreference.matches("memset", Some("c++"), "provided by `<cstring>`"));
+        assert!(!cppreference.matches("vector", Some("Rust"), "// In namespace std"));
+        assert!(!cppreference.matches("vector", None, "// In namespace std"));
+        assert!(!cppreference.matches("Frame", Some("C++"), "provided by `\"Frame.hpp\"`"));
+
+        let web = doc_source(r#"{ "label": "Web", "url": "https://duckduckgo.com/?q={symbol}" }"#);
+        assert!(web.matches("anything", None, ""));
+    }
+
+    #[test]
+    fn test_hover_doc_source_validation() {
+        let parse = |json: &str| {
+            crate::editor_settings::HoverDocSource::from_content(
+                serde_json::from_str(json).unwrap(),
+            )
+        };
+        assert!(parse(r#"{ "label": "a" }"#).is_err());
+        assert!(parse(r#"{ "label": "a", "url": "x", "command": ["y"] }"#).is_err());
+        assert!(parse(r#"{ "label": "a", "command": [] }"#).is_err());
+        assert!(parse(r#"{ "label": "a", "url": "x", "pattern": "(" }"#).is_err());
+        assert!(parse(r#"{ "label": "a", "url": "x" }"#).is_ok());
+    }
+
+    #[test]
+    fn test_expand_hover_template() {
+        assert_eq!(
+            expand_hover_template(
+                "https://duckduckgo.com/?q={language}+{symbol}",
+                "std::vector<int>",
+                "C++",
+                true
+            ),
+            "https://duckduckgo.com/?q=C%2B%2B+std%3A%3Avector%3Cint%3E"
+        );
+        assert_eq!(
+            expand_hover_template("{symbol}", "vkCreateSemaphore", "C++", false),
+            "vkCreateSemaphore"
+        );
+    }
+
+    #[test]
+    fn test_ask_about_symbol_prompt() {
+        let prompt = ask_about_symbol_prompt(
+            "vkCreateSemaphore",
+            Some("C++"),
+            "    if (vkCreateSemaphore(device, &info, nullptr, &sem) != VK_SUCCESS)",
+            "### function\n\nCreate a new queue semaphore object",
+        );
+        assert!(prompt.contains("`vkCreateSemaphore` (C++)"));
+        assert!(prompt.contains(
+            "```\nif (vkCreateSemaphore(device, &info, nullptr, &sem) != VK_SUCCESS)\n```"
+        ));
+        assert!(prompt.contains("Create a new queue semaphore object"));
+        assert!(!prompt.contains('…'));
+
+        let long_hover = "é".repeat(ASK_AI_MAX_HOVER_BYTES);
+        let prompt = ask_about_symbol_prompt("x", None, "x", &long_hover);
+        assert!(prompt.contains("(código)"));
+        assert!(prompt.ends_with("…\n"));
+        assert!(prompt.len() < ASK_AI_MAX_HOVER_BYTES + 400);
+
+        let prompt = ask_about_symbol_prompt("x", None, "x", "  ");
+        assert!(!prompt.contains("language server"));
+    }
+
+    #[test]
+    fn test_clean_doxygen_markdown_glfw() {
+        // Verbatim clangd hover for `glfwGetVideoMode` (GLFW 3.4).
+        let input = "### Returns\n\n\
+            `const GLFWvidmode *` - The current mode of the monitor, or `NULL` if an\n\
+            [error](**@ref** `error_handling)` occurred.\n\n\
+            ---\n\
+            ### Details\n\n\
+            This function returns the current video mode.\n\n\
+            **@errors** Possible errors include **@ref** `GLFW_NOT_INITIALIZED` and **@ref** `GLFW_PLATFORM_ERROR.`\n\n\
+            **@pointer_lifetime** The returned array is allocated and freed by GLFW.\n\n\
+            **@thread_safety** This function must only be called from the main thread.\n\n\
+            **@sa** **@ref** `monitor_modes`\n\n\
+            **@sa** **@ref** `glfwGetVideoModes`\n\n\
+            **@since** Added in version 3.0.  Replaces `glfwGetDesktopMode`.\n\n\
+            **@ingroup** `monitor`";
+        assert_eq!(
+            clean_doxygen_markdown(input),
+            "### Returns\n\n\
+            `const GLFWvidmode *` - The current mode of the monitor, or `NULL` if an\n\
+            error occurred.\n\n\
+            ---\n\
+            ### Details\n\n\
+            This function returns the current video mode.\n\n\
+            **Errors:** Possible errors include `GLFW_NOT_INITIALIZED` and `GLFW_PLATFORM_ERROR`.\n\n\
+            **Pointer lifetime:** The returned array is allocated and freed by GLFW.\n\n\
+            **Thread safety:** This function must only be called from the main thread.\n\n\
+            **See also:** `monitor_modes`, `glfwGetVideoModes`\n\n\
+            **Since:** Added in version 3.0.  Replaces `glfwGetDesktopMode`."
+        );
+    }
+
+    #[test]
+    fn test_clean_doxygen_markdown_libstdcxx() {
+        // `%` autolink escapes and HTML links from libstdc++ comments.
+        assert_eq!(
+            clean_doxygen_markdown(
+                "Resizes the %vector to the %specified size.\n\n\
+                 Meets the requirements of a <a href=\"tables.html#65\">container</a>, and \
+                 <code>push_front</code>.\n\n\
+                 Prints with %d and %lu (100%)."
+            ),
+            "Resizes the vector to the specified size.\n\n\
+             Meets the requirements of a container, and `push_front`.\n\n\
+             Prints with %d and %lu (100%)."
+        );
+        // `[text](@ref target)` links.
+        assert_eq!(
+            clean_doxygen_markdown("The [window hint](@ref window_hints) to set."),
+            "The window hint to set."
+        );
+    }
+
+    #[test]
+    fn test_clean_doxygen_markdown_keeps_code_blocks() {
+        let input = "```cpp\n// %vector **@ref** `x`\n\n\nint a;\n```\n\n\n**@note** Careful.\n";
+        assert_eq!(
+            clean_doxygen_markdown(input),
+            "```cpp\n// %vector **@ref** `x`\n\n\nint a;\n```\n\n**Note:** Careful.\n"
+        );
+    }
+
+    #[test]
+    fn test_remove_rules_before_headings() {
+        // clangd-style hover: every section has a rule and a heading.
+        assert_eq!(
+            remove_rules_before_headings(
+                "### function\n\n---\n```cpp\nint f();\n```\n\n---\n### Brief\n\nDoes f.\n\n---\n### Details\n\nMore."
+            ),
+            "### function\n\n---\n```cpp\nint f();\n```\n\n### Brief\n\nDoes f.\n\n### Details\n\nMore."
+        );
+        // A rule followed by plain text is kept.
+        assert_eq!(
+            remove_rules_before_headings("a\n\n---\n\nb"),
+            "a\n\n---\n\nb"
+        );
+        // A setext underline is not a rule.
+        assert_eq!(
+            remove_rules_before_headings("Title\n---\n# Next"),
+            "Title\n---\n# Next"
+        );
+        // Rules inside code fences are left alone.
+        assert_eq!(
+            remove_rules_before_headings("```\n\n---\n# not a heading\n```"),
+            "```\n\n---\n# not a heading\n```"
+        );
+        // `***` and `___` rules, with a blank line before the heading.
+        assert_eq!(
+            remove_rules_before_headings("a\n\n***\n\n## H\n\n___\n\n### I"),
+            "a\n\n## H\n\n### I"
+        );
     }
 
     #[test]

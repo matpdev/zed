@@ -627,6 +627,17 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// Opens a new agent thread asking about a symbol (sent from the hover popover).
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct AskAboutSymbol {
+        /// The symbol being asked about, used as the thread title.
+        pub symbol: SharedString,
+        /// The full question sent to the agent.
+        pub prompt: String,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

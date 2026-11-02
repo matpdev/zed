@@ -158,6 +158,26 @@
   // after the mouse moves away from the hover target.
   // Only applies when `hover_popover_sticky` is enabled.
   "hover_popover_hiding_delay": 300,
+  // Font size (in pixels) of the text in the informational hover box.
+  // When null, the hover box uses the buffer font size.
+  "hover_popover_font_size": null,
+  // Maximum width of the informational hover box, in characters.
+  // The hover box never grows past half of the editor width.
+  "hover_popover_max_width": 120,
+  // Action buttons shown at the bottom of the informational hover box.
+  "hover_popover_actions": {
+    // Whether to show an "Ask AI" button that opens a new agent thread
+    // asking about the hovered symbol. Hidden when AI is disabled.
+    "ask_ai": true,
+    // Documentation sources offered for the hovered symbol, in order.
+    // Each source has a "label" and either a "url" or a "command" (a list with
+    // the program and its arguments); both may use the {symbol} and {language}
+    // placeholders. Optional filters: "pattern" (regex on the symbol),
+    // "languages" (list of language names) and "hover_pattern" (regex on the
+    // hover documentation). For example:
+    //   { "label": "Web", "url": "https://duckduckgo.com/?q={language}+{symbol}" }
+    "doc_sources": []
+  },
   // Whether to confirm before quitting Zed.
   "confirm_quit": false,
   // Whether to restore last closed project when fresh Zed instance is opened

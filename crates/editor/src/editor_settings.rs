@@ -28,6 +28,9 @@ pub struct EditorSettings {
     pub hover_popover_delay: DelayMs,
     pub hover_popover_sticky: bool,
     pub hover_popover_hiding_delay: DelayMs,
+    pub hover_popover_font_size: Option<gpui::Pixels>,
+    pub hover_popover_max_width: u32,
+    pub hover_popover_actions: HoverPopoverActions,
     pub toolbar: Toolbar,
     pub scrollbar: Scrollbar,
     pub minimap: Minimap,
@@ -206,6 +209,99 @@ pub struct SearchSettings {
     pub search_on_type: bool,
 }
 
+/// Resolved `hover_popover_actions` setting.
+#[derive(Clone, Debug, Default)]
+pub struct HoverPopoverActions {
+    pub ask_ai: bool,
+    pub doc_sources: Vec<HoverDocSource>,
+}
+
+/// A documentation source offered in the hover popover footer.
+#[derive(Clone, Debug)]
+pub struct HoverDocSource {
+    pub label: gpui::SharedString,
+    pub pattern: Option<regex::Regex>,
+    pub languages: Option<Vec<String>>,
+    pub hover_pattern: Option<regex::Regex>,
+    pub target: HoverDocTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoverDocTarget {
+    /// URL template to open.
+    Url(String),
+    /// Program and argument templates to run.
+    Command(Vec<String>),
+}
+
+impl HoverPopoverActions {
+    fn from_content(content: settings::HoverPopoverActionsContent) -> Self {
+        Self {
+            ask_ai: content.ask_ai.unwrap_or(true),
+            doc_sources: content
+                .doc_sources
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|source| {
+                    let label = source.label.clone();
+                    HoverDocSource::from_content(source)
+                        .map_err(|error| {
+                            log::warn!(
+                                "ignoring hover_popover_actions doc source {label:?}: {error}"
+                            )
+                        })
+                        .ok()
+                })
+                .collect(),
+        }
+    }
+}
+
+impl HoverDocSource {
+    pub(crate) fn from_content(content: settings::HoverDocSourceContent) -> anyhow::Result<Self> {
+        let compile = |pattern: Option<String>, field: &str| {
+            pattern
+                .map(|pattern| {
+                    regex::Regex::new(&pattern)
+                        .map_err(|error| anyhow::anyhow!("invalid `{field}` regex: {error}"))
+                })
+                .transpose()
+        };
+        let target = match (content.url, content.command) {
+            (Some(url), None) => HoverDocTarget::Url(url),
+            (None, Some(command)) if !command.is_empty() => HoverDocTarget::Command(command),
+            (None, Some(_)) => anyhow::bail!("`command` must not be empty"),
+            _ => anyhow::bail!("exactly one of `url` or `command` must be set"),
+        };
+        Ok(Self {
+            label: content.label.into(),
+            pattern: compile(content.pattern, "pattern")?,
+            languages: content.languages,
+            hover_pattern: compile(content.hover_pattern, "hover_pattern")?,
+            target,
+        })
+    }
+
+    /// Whether this source applies to `symbol`, written in `language`, with `hover_text`
+    /// as the language server's documentation.
+    pub fn matches(&self, symbol: &str, language: Option<&str>, hover_text: &str) -> bool {
+        self.pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.is_match(symbol))
+            && self.languages.as_ref().is_none_or(|languages| {
+                language.is_some_and(|language| {
+                    languages
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(language))
+                })
+            })
+            && self
+                .hover_pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.is_match(hover_text))
+    }
+}
+
 impl EditorSettings {
     pub fn jupyter_enabled(cx: &App) -> bool {
         EditorSettings::get_global(cx).jupyter.enabled
@@ -239,6 +335,13 @@ impl Settings for EditorSettings {
             hover_popover_delay: editor.hover_popover_delay.unwrap(),
             hover_popover_sticky: editor.hover_popover_sticky.unwrap(),
             hover_popover_hiding_delay: editor.hover_popover_hiding_delay.unwrap(),
+            hover_popover_font_size: editor
+                .hover_popover_font_size
+                .map(|size| theme_settings::clamp_font_size(gpui::px(size.0))),
+            hover_popover_max_width: editor.hover_popover_max_width.unwrap().max(20),
+            hover_popover_actions: HoverPopoverActions::from_content(
+                editor.hover_popover_actions.unwrap(),
+            ),
             toolbar: Toolbar {
                 breadcrumbs: toolbar.breadcrumbs.unwrap(),
                 quick_actions: toolbar.quick_actions.unwrap(),

@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, AskAboutSymbol, ConflictContent, LogoutAgent, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -527,6 +527,31 @@ pub fn init(cx: &mut App) {
                             );
                         });
                     }
+                })
+                .register_action(|workspace, action: &AskAboutSymbol, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    let blocks = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        action.prompt.clone(),
+                    ))];
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            Some(action.symbol.clone()),
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks,
+                                auto_submit: true,
+                            }),
+                            true,
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                    });
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {

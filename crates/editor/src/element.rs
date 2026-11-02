@@ -4459,8 +4459,21 @@ impl EditorElement {
             horizontal_offset: Pixels,
         }
 
+        // `em_width` is measured with the buffer font; when the hover box uses its own font
+        // size, scale it so `hover_popover_max_width` stays a width in hover characters.
+        let editor_settings = EditorSettings::get_global(cx);
+        let hover_em_width = match editor_settings.hover_popover_font_size {
+            Some(hover_font_size) => {
+                let buffer_font_size =
+                    theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx);
+                em_width * (hover_font_size / buffer_font_size)
+            }
+            None => em_width,
+        };
+        let max_hover_width = editor_settings.hover_popover_max_width as f32 * hover_em_width;
+
         let mut max_size = size(
-            (120. * em_width) // Default size
+            max_hover_width // Default size
                 .min(hitbox.size.width / 2.) // Shrink to half of the editor width
                 .max(MIN_POPOVER_CHARACTER_WIDTH * em_width), // Apply minimum width of 20 characters
             (16. * line_height) // Default size
