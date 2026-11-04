@@ -25,9 +25,12 @@ Personal Zed build on top of upstream `main` (merged in regularly), with:
 | `script/build-custom --dev [--test]` | Debug build for iterating (`target/debug/zed`). |
 | `script/run-dev` | Run the debug build with live hover style tuning from `hover-style.json`. |
 
-Release builds run on GitHub Actions (`.github/workflows/custom_release.yml`) on every push to
-`custom` (or manually from the Actions tab), take about 1–1.5 h, and are published as a
+Release builds (Linux x86_64 tarball, macOS Apple Silicon and Intel `.dmg`) run on GitHub Actions
+(`.github/workflows/custom_release.yml`) on every push to `custom` (or manually from the Actions tab), take about 1–1.5 h, and are published as a
 `custom-<version>-<commit>` release; the 5 newest are kept. Locally only the debug build is kept.
+The macOS app is signed ad hoc and not notarized: after copying it to Applications, run
+`xattr -dr com.apple.quarantine /Applications/Zed.app` once. A failed macOS build does not block
+the release; it is published with whatever built.
 
 The last 3 installed releases are kept (`KEEP=n` to change). Settings, extensions and sessions
 live in `~/.config/zed` and `~/.local/share/zed` and are never touched.

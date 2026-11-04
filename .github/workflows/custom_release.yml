@@ -1,5 +1,6 @@
-# Builds the personal Zed (branch `custom`) and publishes it as a GitHub release of the fork.
-# Install it locally with `script/install-custom` (downloads the latest release).
+# Builds the personal Zed (branch `custom`) for Linux and macOS and publishes it as a GitHub
+# release of the fork. Install it on Linux with `script/install-custom` (downloads the latest
+# release); on macOS open the .dmg from the release page.
 name: Custom release
 
 on:
@@ -17,7 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  linux:
     # Only in the fork: never run if this file ends up upstream.
     if: github.repository == 'matpdev/zed'
     runs-on: ubuntu-24.04
@@ -55,18 +56,90 @@ jobs:
       - name: Package
         run: script/package-custom dist/zed-custom-linux-x86_64.tar.gz
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/zed-custom-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    if: github.repository == 'matpdev/zed'
+    # script/bundle-mac requires the macOS 26 SDK (Xcode 26).
+    runs-on: macos-26
+    timeout-minutes: 330
+    strategy:
+      # A failed macOS build must not stop the other architecture or the release.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      ZED_UPDATE_EXPLANATION: "Custom build: download the new .dmg from github.com/matpdev/zed/releases"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          df -h /
+
+      # Without Apple signing secrets, bundle-mac signs the app ad hoc and skips notarization.
+      - name: Bundle
+        run: ./script/bundle-mac ${{ matrix.target }}
+
+      - name: Rename DMG
+        run: |
+          mkdir -p dist
+          mv target/${{ matrix.target }}/release/Zed-${{ matrix.arch }}.dmg \
+            dist/zed-custom-macos-${{ matrix.arch }}.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/zed-custom-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, macos]
+    # Publish whenever Linux built, with whichever macOS builds succeeded.
+    if: always() && needs.linux.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          ls -la dist
           release=$(tar -xzOf dist/zed-custom-linux-x86_64.tar.gz zed-custom/RELEASE)
           # Not `v*`: those tags would trigger Zed's own release workflow.
           tag="custom-$release"
+          notes="$(git log -1 --format='%s%n%n%b')
+
+          macOS: the app is not notarized. After copying Zed to Applications, run once:
+          \`xattr -dr com.apple.quarantine /Applications/Zed.app\`"
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$tag" dist/zed-custom-linux-x86_64.tar.gz \
+          gh release create "$tag" dist/* \
             --target "$GITHUB_SHA" --latest \
             --title "Zed custom $release" \
-            --notes "$(git log -1 --format='%s%n%n%b')"
+            --notes "$notes"
           # Keep the 5 newest custom releases.
           gh release list --limit 100 --json tagName,createdAt \
             --jq 'map(select(.tagName | startswith("custom-"))) | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
