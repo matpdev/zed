@@ -7,6 +7,9 @@ Personal Zed build on top of the latest stable release tag, with:
 - **Hover actions**: `hover_popover_actions` setting with documentation buttons (URL or command,
   filtered by symbol/language/hover text), web search and "Perguntar à IA"
   (`agent::AskAboutSymbol`, opens an agent thread and sends the question).
+- **`disabled_capabilities`** per language server (`"lsp": {"server": {"disabled_capabilities":
+  ["completion", "hover"]}}`): Zed ignores those features of the server, at startup and on
+  dynamic registration. Used to keep only the diagnostics of `shader-language-server` for GLSL.
 - **Doxygen cleanup** for C/C++ hovers: `@ref`, `@sa`, `%word`, HTML links, unknown commands
   (`@errors`, `@thread_safety`, …) turned into readable Markdown.
 

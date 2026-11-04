@@ -291,6 +291,11 @@ pub struct LspSettings {
     #[serde(default = "default_true")]
     pub enable_lsp_tasks: bool,
     pub fetch: Option<FetchSettings>,
+    /// Features of this language server that Zed should not use, for example to keep only
+    /// the diagnostics of a server whose completions are worse than another server's.
+    ///
+    /// Default: []
+    pub disabled_capabilities: Option<Vec<LspCapability>>,
 }
 
 impl Default for LspSettings {
@@ -301,8 +306,27 @@ impl Default for LspSettings {
             settings: None,
             enable_lsp_tasks: true,
             fetch: None,
+            disabled_capabilities: None,
         }
     }
+}
+
+/// A language server feature that can be turned off with `disabled_capabilities`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LspCapability {
+    Completion,
+    Hover,
+    SignatureHelp,
+    Definition,
+    References,
+    DocumentHighlight,
+    DocumentSymbol,
+    CodeAction,
+    Formatting,
+    Rename,
+    InlayHint,
+    SemanticTokens,
 }
 
 #[with_fallible_options]

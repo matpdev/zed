@@ -28956,6 +28956,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                disabled_capabilities: None,
             },
         );
     });
@@ -28977,6 +28978,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                disabled_capabilities: None,
             },
         );
     });
@@ -28998,6 +29000,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                disabled_capabilities: None,
             },
         );
     });
@@ -29017,6 +29020,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 initialization_options: None,
                 enable_lsp_tasks: false,
                 fetch: None,
+                disabled_capabilities: None,
             },
         );
     });

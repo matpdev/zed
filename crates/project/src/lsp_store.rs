@@ -490,6 +490,7 @@ impl LocalLspStore {
         let worktree_abs_path = worktree.abs_path();
         let toolchain = key.toolchain.clone();
         let override_options = settings.initialization_options.clone();
+        let disabled_capabilities = settings.disabled_capabilities.clone().unwrap_or_default();
 
         let stderr_capture = Arc::new(Mutex::new(Some(String::new())));
 
@@ -679,6 +680,15 @@ impl LocalLspStore {
                                 });
                             }
                         })?;
+
+                    if !disabled_capabilities.is_empty() {
+                        language_server.update_capabilities(|capabilities| {
+                            dynamic_registration::remove_disabled_capabilities(
+                                capabilities,
+                                &disabled_capabilities,
+                            )
+                        });
+                    }
 
                     language_server.notify::<lsp::notification::DidChangeConfiguration>(
                         did_change_configuration_params,

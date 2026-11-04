@@ -14,10 +14,69 @@ use lsp::{
     TextDocumentSyncSaveOptions,
 };
 
+use settings::{LspCapability, Settings as _};
+
 use crate::lsp_store::{
     LanguageServerState, LspStore, RenamePathsWatchedForServer,
     completion_trigger_characters_for_buffer, lsp_workspace_diagnostics_refresh,
 };
+use crate::project_settings::ProjectSettings;
+
+/// The LSP methods whose registration a disabled capability blocks.
+fn capability_methods(capability: LspCapability) -> &'static [&'static str] {
+    match capability {
+        LspCapability::Completion => &["textDocument/completion"],
+        LspCapability::Hover => &["textDocument/hover"],
+        LspCapability::SignatureHelp => &["textDocument/signatureHelp"],
+        LspCapability::Definition => &["textDocument/definition"],
+        LspCapability::References => &["textDocument/references"],
+        LspCapability::DocumentHighlight => &["textDocument/documentHighlight"],
+        LspCapability::DocumentSymbol => &["textDocument/documentSymbol"],
+        LspCapability::CodeAction => &["textDocument/codeAction"],
+        LspCapability::Formatting => &[
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+            "textDocument/onTypeFormatting",
+        ],
+        LspCapability::Rename => &["textDocument/rename"],
+        LspCapability::InlayHint => &["textDocument/inlayHint"],
+        LspCapability::SemanticTokens => &["textDocument/semanticTokens"],
+    }
+}
+
+pub(super) fn is_disabled_registration(disabled: &[LspCapability], method: &str) -> bool {
+    disabled
+        .iter()
+        .any(|capability| capability_methods(*capability).contains(&method))
+}
+
+/// Removes the capabilities listed in the server's `disabled_capabilities` setting, so that
+/// Zed never sends the corresponding requests to it.
+pub(super) fn remove_disabled_capabilities(
+    capabilities: &mut lsp::ServerCapabilities,
+    disabled: &[LspCapability],
+) {
+    for capability in disabled {
+        match capability {
+            LspCapability::Completion => capabilities.completion_provider = None,
+            LspCapability::Hover => capabilities.hover_provider = None,
+            LspCapability::SignatureHelp => capabilities.signature_help_provider = None,
+            LspCapability::Definition => capabilities.definition_provider = None,
+            LspCapability::References => capabilities.references_provider = None,
+            LspCapability::DocumentHighlight => capabilities.document_highlight_provider = None,
+            LspCapability::DocumentSymbol => capabilities.document_symbol_provider = None,
+            LspCapability::CodeAction => capabilities.code_action_provider = None,
+            LspCapability::Formatting => {
+                capabilities.document_formatting_provider = None;
+                capabilities.document_range_formatting_provider = None;
+                capabilities.document_on_type_formatting_provider = None;
+            }
+            LspCapability::Rename => capabilities.rename_provider = None,
+            LspCapability::InlayHint => capabilities.inlay_hint_provider = None,
+            LspCapability::SemanticTokens => capabilities.semantic_tokens_provider = None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum RegistrationSource {
@@ -384,7 +443,20 @@ impl LspStore {
         let server = self
             .language_server_for_id(server_id)
             .with_context(|| format!("no server {server_id} found"))?;
+        let disabled_capabilities = ProjectSettings::get_global(cx)
+            .lsp
+            .get(&server.name())
+            .and_then(|settings| settings.disabled_capabilities.clone())
+            .unwrap_or_default();
         for reg in params.registrations {
+            if is_disabled_registration(&disabled_capabilities, &reg.method) {
+                log::info!(
+                    "ignoring registration of {} for {}: disabled in settings",
+                    reg.method,
+                    server.name()
+                );
+                continue;
+            }
             match reg.method.as_str() {
                 "workspace/didChangeWatchedFiles" => {
                     if let Some(options) = reg.register_options {
@@ -1288,5 +1360,50 @@ fn take_text_document_sync_options(
             sync_options
         }
         None => lsp::TextDocumentSyncOptions::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removes_disabled_capabilities() {
+        let mut capabilities = lsp::ServerCapabilities {
+            completion_provider: Some(lsp::CompletionOptions::default()),
+            hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+            definition_provider: Some(OneOf::Left(true)),
+            document_formatting_provider: Some(OneOf::Left(true)),
+            document_range_formatting_provider: Some(OneOf::Left(true)),
+            ..lsp::ServerCapabilities::default()
+        };
+        remove_disabled_capabilities(
+            &mut capabilities,
+            &[
+                LspCapability::Completion,
+                LspCapability::Hover,
+                LspCapability::Formatting,
+            ],
+        );
+        assert_eq!(capabilities.completion_provider, None);
+        assert_eq!(capabilities.hover_provider, None);
+        assert_eq!(capabilities.document_formatting_provider, None);
+        assert_eq!(capabilities.document_range_formatting_provider, None);
+        assert_eq!(capabilities.definition_provider, Some(OneOf::Left(true)));
+    }
+
+    #[test]
+    fn blocks_disabled_registrations() {
+        let disabled = [LspCapability::Completion, LspCapability::Formatting];
+        assert!(is_disabled_registration(
+            &disabled,
+            "textDocument/completion"
+        ));
+        assert!(is_disabled_registration(
+            &disabled,
+            "textDocument/rangeFormatting"
+        ));
+        assert!(!is_disabled_registration(&disabled, "textDocument/hover"));
+        assert!(!is_disabled_registration(&[], "textDocument/completion"));
     }
 }
