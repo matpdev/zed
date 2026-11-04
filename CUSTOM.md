@@ -1,6 +1,6 @@
 # Zed custom (matpdev/zed, branch `custom`)
 
-Personal Zed build on top of the latest stable release tag, with:
+Personal Zed build on top of upstream `main` (merged in regularly), with:
 
 - **Hover readability**: smaller, muted section headings; tighter spacing; no redundant `---`
   before headings; `hover_popover_font_size` and `hover_popover_max_width` settings.
@@ -32,16 +32,15 @@ Release builds run on GitHub Actions (`.github/workflows/custom_release.yml`) on
 The last 3 installed releases are kept (`KEEP=n` to change). Settings, extensions and sessions
 live in `~/.config/zed` and `~/.local/share/zed` and are never touched.
 
-## Updating to a new Zed release
+## Updating from upstream
 
 ```sh
 cd ~/Projects/zed
-git fetch upstream --tags
+git switch main && git pull upstream main
 git switch custom
-git rebase v1.27.0          # the new stable tag (or: git merge v1.27.0)
-# fix conflicts if any, then:
+git merge main              # fix conflicts if any
 script/build-custom --dev --test             # optional: check that it builds and tests pass
-git push --force-with-lease origin custom    # rebase rewrites history; starts the release build
+git push origin custom      # starts the release build
 # ~1–1.5 h later, when the "Custom release" workflow is green:
 script/install-custom
 ```
