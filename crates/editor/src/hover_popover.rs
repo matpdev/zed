@@ -1776,8 +1776,11 @@ impl HoverState {
         if let Some(diagnostic_popover) = self.diagnostic_popover.as_ref() {
             elements.push(diagnostic_popover.render(max_size, window, cx));
         }
-        for info_popover in &mut self.info_popovers {
-            elements.push(info_popover.render(snapshot, max_size, window, cx));
+        // Several language servers can answer the same hover (e.g. clangd and a docs server);
+        // the actions are about the symbol, so they are shown once, below the last popover.
+        let last_index = self.info_popovers.len().saturating_sub(1);
+        for (index, info_popover) in self.info_popovers.iter_mut().enumerate() {
+            elements.push(info_popover.render(snapshot, index == last_index, max_size, window, cx));
         }
 
         Some((point, elements))
@@ -1934,6 +1937,7 @@ impl InfoPopover {
     pub(crate) fn render(
         &mut self,
         snapshot: &EditorSnapshot,
+        show_actions: bool,
         max_size: Size<Pixels>,
         window: &mut Window,
         cx: &mut Context<Editor>,
@@ -1945,7 +1949,7 @@ impl InfoPopover {
         let parsed_content = self.parsed_content.clone();
         let debugger_hover = self.debugger_hover.clone();
         let debugger_hover_only = debugger_hover.is_some();
-        let actions_footer = if debugger_hover_only {
+        let actions_footer = if debugger_hover_only || !show_actions {
             None
         } else {
             self.render_actions_footer(snapshot, parsed_content.as_ref(), cx)
