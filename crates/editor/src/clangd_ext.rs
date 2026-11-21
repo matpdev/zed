@@ -11,7 +11,7 @@ use crate::lsp_ext::find_specific_language_server_in_selection;
 
 use crate::{Editor, SwitchSourceHeader, element::register_action};
 
-use project::lsp_store::clangd_ext::CLANGD_SERVER_NAME;
+use project::lsp_store::clangd_ext::{CLANGD_SERVER_NAME, CLICE_SERVER_NAME};
 
 fn is_c_language(language: &Language) -> bool {
     language.name() == "C++" || language.name() == "C"
@@ -31,7 +31,15 @@ pub fn switch_source_header(
     };
 
     let Some((_, _, server_to_query, buffer)) =
-        find_specific_language_server_in_selection(editor, cx, is_c_language, CLANGD_SERVER_NAME)
+        find_specific_language_server_in_selection(editor, cx, is_c_language, CLICE_SERVER_NAME)
+            .or_else(|| {
+                find_specific_language_server_in_selection(
+                    editor,
+                    cx,
+                    is_c_language,
+                    CLANGD_SERVER_NAME,
+                )
+            })
     else {
         return;
     };
