@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Ok, Result};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
     FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style, Weight,
@@ -14,7 +14,7 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, path::PathBuf, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
@@ -59,6 +59,63 @@ struct CosmicTextSystemState {
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
+    lazy_system_fonts: Option<LazySystemFonts>,
+}
+
+struct LazySystemFonts {
+    unloaded_families: HashMap<String, Vec<PathBuf>>,
+    loaded_font_paths: HashSet<PathBuf>,
+    attempted_fallback_chars: HashSet<char>,
+    all_family_names: Vec<String>,
+}
+
+impl LazySystemFonts {
+    #[cfg(target_os = "linux")]
+    fn from_fontconfig() -> Option<Self> {
+        let output = std::process::Command::new("fc-list")
+            .arg("--format=%{family}\t%{file}\n")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut unloaded_families: HashMap<String, Vec<PathBuf>> = HashMap::default();
+        let mut all_family_names = Vec::new();
+        for line in stdout.lines() {
+            let Some((families, file_path)) = line.split_once('\t') else {
+                continue;
+            };
+            if file_path.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(file_path);
+            for family in families.split(',') {
+                let family = family.trim();
+                if family.is_empty() {
+                    continue;
+                }
+                let entry = unloaded_families.entry(family.to_string()).or_insert_with(|| {
+                    all_family_names.push(family.to_string());
+                    Vec::new()
+                });
+                if !entry.contains(&path) {
+                    entry.push(path.clone());
+                }
+            }
+        }
+        Some(Self {
+            unloaded_families,
+            loaded_font_paths: HashSet::default(),
+            attempted_fallback_chars: HashSet::default(),
+            all_family_names,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn from_fontconfig() -> Option<Self> {
+        None
+    }
 }
 
 struct LoadedFont {
@@ -129,7 +186,16 @@ impl CosmicTextSystem {
     }
 
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
+        let (font_system, lazy_system_fonts) = match LazySystemFonts::from_fontconfig() {
+            Some(lazy) => (
+                FontSystem::new_with_locale_and_db(
+                    "en-US".to_string(),
+                    cosmic_text::fontdb::Database::new(),
+                ),
+                Some(lazy),
+            ),
+            None => (FontSystem::new(), None),
+        };
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
@@ -141,6 +207,7 @@ impl CosmicTextSystem {
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
+            lazy_system_fonts,
         }))
     }
 
@@ -160,6 +227,7 @@ impl CosmicTextSystem {
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
+            lazy_system_fonts: None,
         }))
     }
 }
@@ -174,14 +242,16 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        let mut result = self
-            .0
-            .read()
+        let state = self.0.read();
+        let mut result = state
             .font_system
             .db()
             .faces()
             .filter_map(|face| face.families.first().map(|family| family.0.clone()))
             .collect_vec();
+        if let Some(lazy) = &state.lazy_system_fonts {
+            result.extend(lazy.all_family_names.iter().cloned());
+        }
         result.sort_unstable();
         result.dedup();
         result
@@ -284,6 +354,83 @@ impl PlatformTextSystem for CosmicTextSystem {
 }
 
 impl CosmicTextSystemState {
+    fn ensure_family_loaded(&mut self, family: &str) {
+        let Some(lazy) = &mut self.lazy_system_fonts else {
+            return;
+        };
+        let Some(paths) = lazy.unloaded_families.remove(family) else {
+            return;
+        };
+        for path in paths {
+            if lazy.loaded_font_paths.insert(path.clone()) {
+                if let Err(error) = self.font_system.db_mut().load_font_file(&path) {
+                    log::warn!("failed to load font file {}: {error}", path.display());
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_fallback_fonts_for_missing_glyphs(
+        &mut self,
+        text: &str,
+        glyphs: &[cosmic_text::LayoutGlyph],
+    ) -> bool {
+        let Some(lazy) = &mut self.lazy_system_fonts else {
+            return false;
+        };
+        let mut new_paths = Vec::new();
+        for glyph in glyphs {
+            if glyph.glyph_id != 0 {
+                continue;
+            }
+            let Some(ch) = text.get(glyph.start..).and_then(|s| s.chars().next()) else {
+                continue;
+            };
+            if !lazy.attempted_fallback_chars.insert(ch) {
+                continue;
+            }
+            let std::result::Result::Ok(output) = std::process::Command::new("fc-match")
+                .arg("--format=%{file}\n")
+                .arg(format!(":charset={:x}", ch as u32))
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            let path_str = String::from_utf8_lossy(&output.stdout);
+            let path_str = path_str.trim();
+            if path_str.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(path_str);
+            if lazy.loaded_font_paths.insert(path.clone()) {
+                new_paths.push(path);
+            }
+        }
+        let loaded_any = !new_paths.is_empty();
+        for path in new_paths {
+            if let Err(error) = self.font_system.db_mut().load_font_file(&path) {
+                log::warn!(
+                    "failed to load fallback font file {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        loaded_any
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn load_fallback_fonts_for_missing_glyphs(
+        &mut self,
+        _text: &str,
+        _glyphs: &[cosmic_text::LayoutGlyph],
+    ) -> bool {
+        false
+    }
+
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
     }
@@ -382,13 +529,14 @@ impl CosmicTextSystemState {
             _ => Arc::from(Vec::new()),
         };
 
-        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
+        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback).to_string();
+        self.ensure_family_loaded(&name);
 
         let families = self
             .font_system
             .db()
             .faces()
-            .filter(|face| face.families.iter().any(|family| *name == family.0))
+            .filter(|face| face.families.iter().any(|family| name == family.0))
             .map(|face| (face.id, face.post_script_name.clone()))
             .collect::<SmallVec<[_; 4]>>();
 
@@ -763,6 +911,32 @@ impl CosmicTextSystemState {
             None,
             cosmic_text::Hinting::Disabled,
         );
+
+        if self.lazy_system_fonts.is_some()
+            && let Some(layout) = layout_lines.first()
+            && layout.glyphs.iter().any(|glyph| glyph.glyph_id == 0)
+            && self.load_fallback_fonts_for_missing_glyphs(text, &layout.glyphs)
+        {
+            layout_lines.clear();
+            let line = ShapeLine::new(
+                &mut self.font_system,
+                text,
+                &attrs_list,
+                cosmic_text::Shaping::Advanced,
+                4,
+            );
+            line.layout_to_buffer(
+                &mut self.scratch,
+                f32::from(font_size),
+                None,
+                cosmic_text::Wrap::None,
+                Ellipsize::None,
+                None,
+                &mut layout_lines,
+                None,
+                cosmic_text::Hinting::Disabled,
+            );
+        }
 
         let Some(layout) = layout_lines.first() else {
             return LineLayout {
@@ -1235,6 +1409,32 @@ mod tests {
             Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
         ])?;
         assert_eq!(text_system.all_font_names(), ["IBM Plex Sans", "Lilex"]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lazy_system_fonts_loads_requested_family_on_demand() -> Result<()> {
+        if LazySystemFonts::from_fontconfig().is_none() {
+            return Ok(());
+        }
+        let text_system = CosmicTextSystem::new("IBM Plex Sans");
+        assert!(text_system.0.read().lazy_system_fonts.is_some());
+        assert_eq!(text_system.0.read().font_system.db().faces().count(), 0);
+
+        let all_names = text_system.all_font_names();
+        assert!(!all_names.is_empty());
+
+        let first_family = all_names
+            .iter()
+            .find(|name| {
+                text_system
+                    .font_id(&gpui::font((*name).clone()))
+                    .is_ok()
+            })
+            .cloned();
+        assert!(first_family.is_some());
+        assert!(text_system.0.read().font_system.db().faces().count() > 0);
         Ok(())
     }
 
