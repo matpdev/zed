@@ -2485,6 +2485,11 @@
     //   Behaves like `"replace"` if the text after the cursor is a suffix of the completion, and like
     //   `"insert"` otherwise.
     "lsp_insert_mode": "replace_suffix",
+    // Whether to prioritize the language server's `sortText` over fuzzy match score
+    // when sorting completions (after exact matches and snippet sort order).
+    //
+    // Default: false
+    "prefer_sort_text": false,
   },
   // Different settings for specific languages.
   "languages": {

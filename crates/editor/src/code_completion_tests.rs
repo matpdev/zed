@@ -153,6 +153,32 @@ async fn test_sort_text(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_prefer_sort_text(cx: &mut TestAppContext) {
+    let completions = vec![
+        CompletionBuilder::function("set_color_space_long_name", None, "3f800000"),
+        CompletionBuilder::function("set_color", None, "41200000"),
+        CompletionBuilder::variable("set_col", None, "42000000"),
+    ];
+
+    let matches = filter_matches("set_col", &completions, cx).await;
+    let sorted = CompletionsMenu::sort_string_matches(
+        matches,
+        Some("set_col"),
+        SnippetSortOrder::default(),
+        true,
+        &completions,
+    );
+    // Exact match ("set_col") comes first, then LSP sort_text order beats fuzzy score.
+    assert_eq!(
+        sorted
+            .iter()
+            .map(|m| m.string.as_str())
+            .collect::<Vec<_>>(),
+        vec!["set_col", "set_color_space_long_name", "set_color"]
+    );
+}
+
+#[gpui::test]
 async fn test_sort_snippet(cx: &mut TestAppContext) {
     let completions = vec![
         CompletionBuilder::constant("println", None, "7fffffff"),
@@ -423,6 +449,7 @@ async fn test_sort_keeps_order_of_equal_keys(cx: &mut TestAppContext) {
         matches,
         Some(query),
         SnippetSortOrder::default(),
+        false,
         &completions,
     );
 
@@ -551,7 +578,13 @@ async fn filter_and_sort_matches(
     cx: &mut TestAppContext,
 ) -> Vec<StringMatch> {
     let matches = filter_matches(query, completions, cx).await;
-    CompletionsMenu::sort_string_matches(matches, Some(query), snippet_sort_order, completions)
+    CompletionsMenu::sort_string_matches(
+        matches,
+        Some(query),
+        snippet_sort_order,
+        false,
+        completions,
+    )
 }
 
 async fn filter_matches(

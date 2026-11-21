@@ -7,6 +7,7 @@ use gpui::{
 };
 use itertools::Itertools;
 use language::CodeLabel;
+use language::language_settings::all_language_settings;
 use language::{Buffer, LanguageName, LanguageRegistry};
 use lsp::{CompletionItemKind, CompletionItemTag};
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement};
@@ -1451,6 +1452,10 @@ impl CompletionsMenu {
         let completions = self.completions.clone();
         let sort_completions = self.sort_completions;
         let snippet_sort_order = self.snippet_sort_order;
+        let prefer_sort_text = all_language_settings(buffer.read(cx).file(), cx)
+            .language(None, self.language.as_ref(), cx)
+            .completions
+            .prefer_sort_text;
         cx.foreground_executor().spawn(async move {
             let mut results = matches_task.await;
 
@@ -1461,6 +1466,7 @@ impl CompletionsMenu {
                     results.filter_matches,
                     Some(&query), // used for non-snippets only
                     snippet_sort_order,
+                    prefer_sort_text,
                     &completions_ref,
                 );
             }
@@ -1519,6 +1525,7 @@ impl CompletionsMenu {
         matches: Vec<StringMatch>,
         query: Option<&str>,
         snippet_sort_order: SnippetSortOrder,
+        prefer_sort_text: bool,
         completions: &[Completion],
     ) -> Vec<StringMatch> {
         let mut matches = matches;
@@ -1528,6 +1535,7 @@ impl CompletionsMenu {
             WordStartMatch {
                 sort_exact: Reverse<i32>,
                 sort_snippet: Reverse<i32>,
+                sort_primary_sort_text: Option<(bool, Option<&'a str>)>,
                 sort_score: Reverse<OrderedFloat<f64>>,
                 sort_positions: Vec<usize>,
                 sort_exact_case_matches: Reverse<usize>,
@@ -1598,9 +1606,13 @@ impl CompletionsMenu {
                     0
                 });
 
+                let sort_primary_sort_text =
+                    prefer_sort_text.then_some((sort_text.is_none(), sort_text));
+
                 MatchTier::WordStartMatch {
                     sort_exact,
                     sort_snippet,
+                    sort_primary_sort_text,
                     sort_score,
                     sort_positions,
                     sort_exact_case_matches,

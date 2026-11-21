@@ -1010,6 +1010,11 @@ pub struct CompletionSettingsContent {
     ///
     /// Default: "replace_suffix"
     pub lsp_insert_mode: Option<LspInsertMode>,
+    /// Whether to prioritize the language server's `sortText` over fuzzy match score
+    /// when sorting completions (after exact matches and snippet sort order).
+    ///
+    /// Default: false
+    pub prefer_sort_text: Option<bool>,
 }
 
 #[derive(

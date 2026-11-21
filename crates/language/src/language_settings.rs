@@ -210,6 +210,11 @@ pub struct CompletionSettings {
     ///
     /// Default: "replace_suffix"
     pub lsp_insert_mode: LspInsertMode,
+    /// Whether to prioritize the language server's `sortText` over fuzzy match score
+    /// when sorting completions (after exact matches and snippet sort order).
+    ///
+    /// Default: false
+    pub prefer_sort_text: bool,
 }
 
 /// The settings for indent guides.
@@ -920,6 +925,7 @@ impl settings::Settings for AllLanguageSettings {
                     lsp: completions.lsp.unwrap(),
                     lsp_fetch_timeout_ms: completions.lsp_fetch_timeout_ms.unwrap(),
                     lsp_insert_mode: completions.lsp_insert_mode.unwrap(),
+                    prefer_sort_text: completions.prefer_sort_text.unwrap_or(false),
                 },
                 debuggers: settings.debuggers.unwrap(),
                 word_diff_enabled: settings.word_diff_enabled.unwrap(),
