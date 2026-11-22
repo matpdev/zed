@@ -644,6 +644,7 @@ pub async fn predict_baseten(
     let request_body = RawCompletionRequest {
         model: model_id,
         prompt: prompt_text.clone(),
+        suffix: None,
         max_tokens: Some(2048),
         temperature: Some(0.),
         stop: vec![],

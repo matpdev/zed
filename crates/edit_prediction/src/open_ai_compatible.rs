@@ -65,6 +65,7 @@ pub(crate) async fn send_custom_server_request(
     provider: settings::EditPredictionProvider,
     settings: &OpenAiCompatibleEditPredictionSettings,
     prompt: String,
+    suffix: Option<String>,
     max_tokens: u32,
     stop_tokens: Vec<String>,
     api_key: Option<Arc<str>>,
@@ -85,6 +86,7 @@ pub(crate) async fn send_custom_server_request(
             let request = RawCompletionRequest {
                 model: settings.model.clone(),
                 prompt,
+                suffix,
                 max_tokens: Some(max_tokens),
                 temperature: None,
                 stop: stop_tokens

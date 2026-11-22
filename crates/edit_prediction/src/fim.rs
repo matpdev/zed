@@ -97,11 +97,19 @@ pub fn request_prediction(
         let cursor_in_editable = cursor_offset_in_excerpt.saturating_sub(editable_range.start);
         let prefix = editable_text[..cursor_in_editable].to_string();
         let suffix = editable_text[cursor_in_editable..].to_string();
-        let prompt = format_fim_prompt(prompt_format, &prefix, &suffix);
-        let stop_tokens = fim_stop_tokens(prompt_format)
-            .iter()
-            .map(|token| token.to_string())
-            .collect();
+        let (prompt, suffix, stop_tokens) =
+            if provider == settings::EditPredictionProvider::OpenAiCompatibleApi
+                && uses_deepseek_fim_api(&settings.api_url)
+            {
+                (prefix, Some(suffix), Vec::new())
+            } else {
+                let prompt = format_fim_prompt(prompt_format, &prefix, &suffix);
+                let stop_tokens = fim_stop_tokens(prompt_format)
+                    .iter()
+                    .map(|token| token.to_string())
+                    .collect();
+                (prompt, None, stop_tokens)
+            };
 
         let max_tokens = settings.max_output_tokens;
 
@@ -109,6 +117,7 @@ pub fn request_prediction(
             provider,
             &settings,
             prompt,
+            suffix,
             max_tokens,
             stop_tokens,
             api_key,
@@ -181,7 +190,8 @@ pub fn infer_prompt_format(model: &str) -> Option<EditPredictionPromptFormat> {
         }
         "codellama" | "code-llama" => EditPredictionPromptFormat::CodeLlama,
         "starcoder" | "starcoder2" | "starcoderbase" => EditPredictionPromptFormat::StarCoder,
-        "deepseek-coder" | "deepseek-coder-v2" => EditPredictionPromptFormat::DeepseekCoder,
+        "deepseek-coder" | "deepseek-coder-v2" | "deepseek-flash" | "deepseek-chat"
+        | "deepseek-v4-pro" => EditPredictionPromptFormat::DeepseekCoder,
         "qwen2.5-coder" | "qwen-coder" | "qwen" => EditPredictionPromptFormat::Qwen,
         "codegemma" => EditPredictionPromptFormat::CodeGemma,
         "codestral" | "mistral" => EditPredictionPromptFormat::Codestral,
@@ -190,6 +200,10 @@ pub fn infer_prompt_format(model: &str) -> Option<EditPredictionPromptFormat> {
             return None;
         }
     })
+}
+
+fn uses_deepseek_fim_api(api_url: &str) -> bool {
+    api_url.contains("api.deepseek.com")
 }
 
 fn format_fim_prompt(
@@ -305,6 +319,14 @@ mod tests {
             infer_prompt_format("deepseek-coder-v2:16b"),
             Some(EditPredictionPromptFormat::DeepseekCoder)
         );
+        assert_eq!(
+            infer_prompt_format("deepseek-flash"),
+            Some(EditPredictionPromptFormat::DeepseekCoder)
+        );
+        assert!(uses_deepseek_fim_api(
+            "https://api.deepseek.com/beta/completions"
+        ));
+        assert!(!uses_deepseek_fim_api("http://localhost:11434"));
         assert_eq!(
             infer_prompt_format("starcoder2:3b"),
             Some(EditPredictionPromptFormat::StarCoder)
