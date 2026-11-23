@@ -11801,7 +11801,7 @@ fn process_completion_for_edit(
 ) -> CompletionEdit {
     let buffer = buffer.read(cx);
     let buffer_snapshot = buffer.snapshot();
-    let (snippet, new_text) = if completion.is_snippet() {
+    let (mut snippet, mut new_text) = if completion.is_snippet() {
         let mut snippet_source = completion.new_text.clone();
         // Workaround for typescript language server issues so that methods don't expand within
         // strings and functions with type expressions. The previous point is used because the query
@@ -11924,6 +11924,17 @@ fn process_completion_for_edit(
         .is_lt()
     {
         range_to_replace.end = *cursor_position;
+    }
+
+    if let Some(expanded_snippet) = crate::clangd_ext::expand_out_of_line_cpp_completion(
+        completion,
+        &range_to_replace,
+        cursor_position,
+        &buffer_snapshot,
+    ) && let Some(parsed_snippet) = Snippet::parse(&expanded_snippet).log_err()
+    {
+        new_text = parsed_snippet.text.clone();
+        snippet = Some(parsed_snippet);
     }
 
     CompletionEdit {
